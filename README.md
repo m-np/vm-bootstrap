@@ -6,6 +6,8 @@ One-command development environment setup for Ubuntu Server VMs and macOS.
 curl -sSL https://raw.githubusercontent.com/m-np/vm-bootstrap/main/setup.sh | bash -s robinhood
 ```
 
+The script is **fully idempotent** — safe to re-run at any time. Each stage checks whether the desired state is already met before doing anything.
+
 ---
 
 ## How it works — root and leaf
@@ -27,7 +29,7 @@ The split exists because responsibilities differ:
 |---|---|---|
 | System packages (`git`, `curl`, `build-essential`) | root | Same on every machine, regardless of project |
 | Homebrew install (macOS) | root | Shared prerequisite, not project-specific |
-| Anaconda install | root | Shared across all envs on the machine |
+| Conda install | root | Shared across all envs on the machine |
 | Cloning / pulling the repo | root | Needs the registry to know where to clone from |
 | SSH vs HTTPS decision | root | Machine-level credential concern, not project-specific |
 | Shell alias registration | root | Knows the keyword and repo name |
@@ -43,36 +45,57 @@ curl setup.sh | bash -s robinhood
         │
         ▼
 [root] detect OS (macOS or Linux) and CPU arch
-[root] install system packages
-          macOS  → Homebrew (if missing) → brew install git curl wget
-          Linux  → apt-get install git curl wget build-essential
-[root] install Anaconda (idempotent, picks correct installer for OS/arch)
-[root] git clone RobinhoodTrader → ~/projects/RobinhoodTrader
+[root] sudo -v upfront (Linux only) — prompts once, keeps timestamp alive
         │
-        ├─ leaf found? (.vmsetup.sh exists)
+        ▼
+[1/6] System packages
+        already installed? → skip
+        macOS  → Homebrew (if missing) → brew install git curl wget
+        Linux  → apt-get install git curl wget build-essential
+        │
+        ▼
+[2/6] Conda
+        already on PATH?          → use it, skip install
+        found at common location? → use it, skip install
+        not found anywhere?       → install Anaconda (picks correct binary for OS/arch)
+        │
+        ▼
+[3/6] Clone / pull repo
+        ~/projects/RobinhoodTrader exists? → git pull
+        otherwise                          → git clone (HTTPS or SSH)
+        │
+        ├─ .vmsetup.sh found in repo?
         │       ▼
-        │   [leaf] create conda env robinhoodtrader
+        │   [leaf] create conda env (skips if already exists)
         │   [leaf] pip install -r requirements.txt
         │   [leaf] install + start PostgreSQL (brew services / systemctl)
         │   [leaf] generate Fernet key → inject into .env
         │   [leaf] warn user to fill in secrets
         │
-        └─ no leaf? → root fallback (environment.yml or requirements.txt)
+        └─ no leaf? → root fallback (environment.yml → requirements.txt → bare env)
         │
         ▼
-[root] register alias in shell profile (~/.zshrc on macOS, ~/.bashrc on Linux)
-[root] print summary + activation command
+[5/6] Shell alias
+        alias already in shell profile? → skip
+        otherwise                       → append to ~/.zshrc (macOS) or ~/.bashrc (Linux)
+        │
+        ▼
+[6/6] Print summary + activation command
 ```
 
-### Why a two-layer design?
+### Idempotency — what each stage checks
 
-**The root stays generic.** `setup.sh` never imports project-specific knowledge. Adding a new project to the registry is one line — you don't touch the orchestration logic.
+| Stage | "Already done" condition | Behaviour |
+|---|---|---|
+| Homebrew | `command -v brew` succeeds | Skip install |
+| System packages | `command -v git/curl/wget` all succeed | Skip apt-get / brew |
+| Conda | Found on PATH **or** at any of 6 common install locations | Skip install, use existing |
+| Conda shell init | Init line already in shell profile | Skip append |
+| Repo clone | `~/projects/<RepoName>/.git` exists | `git pull` instead |
+| Conda env (fallback) | Env name appears in `conda env list` | Skip creation |
+| Shell alias | Alias line already in shell profile | Skip append |
 
-**The leaf stays self-contained.** `.vmsetup.sh` lives inside the project repo, versioned alongside the code it sets up. When the project's dependencies change, the leaf script changes in the same commit. The root doesn't need to be updated.
-
-**Leaf scripts are also standalone.** A contributor who already has Anaconda and a cloned repo can run `.vmsetup.sh` directly without going through `setup.sh` at all. The contract between root and leaf is minimal: working directory is the repo root, `conda` is on `PATH`.
-
-**Safe for others to use.** The root script works for any public repo without credentials. Private repos require `--ssh` and an SSH key on the machine. The root detects the failure and explains what to do — it never silently half-installs.
+The leaf script (`.vmsetup.sh`) is responsible for its own idempotency — see [VMSETUP_GUIDE.md](VMSETUP_GUIDE.md).
 
 ---
 
@@ -96,11 +119,11 @@ bash setup.sh <keyword> [--ssh]
 ### Examples
 
 ```bash
-# Public repo, or private repo with an SSH key on the machine
-bash setup.sh robinhood --ssh
-
 # Public repo via HTTPS (no SSH key needed)
 bash setup.sh robinhood
+
+# Private repo — requires an SSH key on this machine added to GitHub
+bash setup.sh robinhood --ssh
 ```
 
 ### Arguments
@@ -112,28 +135,22 @@ bash setup.sh robinhood
 
 ---
 
-## What it does
+## Sudo and the curl pipe
 
-| Step | Action |
-|---|---|
-| 1 | Install system packages (brew or apt-get depending on OS) |
-| 2 | Downloads and installs Anaconda to `~/anaconda3` (picks correct binary for OS/arch) |
-| 3 | Clones repo to `~/projects/<RepoName>` (or `git pull` if already cloned) |
-| 4 | Runs `.vmsetup.sh` in the repo if it exists, otherwise runs a default conda env setup |
-| 5 | Registers a shell alias in `~/.zshrc` (macOS) or `~/.bashrc` (Linux) |
-| 6 | Prints a summary with the activation command |
+When piped through `curl | bash`, sudo prompts can appear with no visible terminal, causing the script to hang silently. The script handles this automatically on Linux by calling `sudo -v` upfront (before any work begins) and keeping the sudo timestamp alive with a background heartbeat.
 
-After setup completes, activate the environment with:
+If you still have issues, download first and run directly — this guarantees the sudo prompt appears in your terminal:
 
 ```bash
-# macOS
-source ~/.zshrc && robinhood
-
-# Linux
-source ~/.bashrc && robinhood
+curl -sSL https://raw.githubusercontent.com/m-np/vm-bootstrap/main/setup.sh -o setup.sh
+bash setup.sh robinhood
 ```
 
-This sources conda, activates the named env, and `cd`s into the project directory.
+Or prime sudo manually before the pipe:
+
+```bash
+sudo -v && curl -sSL https://raw.githubusercontent.com/m-np/vm-bootstrap/main/setup.sh | bash -s robinhood
+```
 
 ---
 

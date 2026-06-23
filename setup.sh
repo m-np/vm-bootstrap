@@ -66,45 +66,104 @@ SSH_URL="git@github.com:$(echo "$HTTPS_URL" | sed 's|https://github.com/||').git
 REPO_NAME="$(basename "$HTTPS_URL")"
 PROJECTS_DIR="$HOME/projects"
 REPO_DIR="$PROJECTS_DIR/$REPO_NAME"
-ANACONDA_DIR="$HOME/anaconda3"
 
 echo "═════════════════════════════════════════════════════════════════════════════"
 echo " VM Bootstrap: $KEYWORD → $REPO_NAME  ($OS / $ARCH)"
 echo "═════════════════════════════════════════════════════════════════════════════"
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Sudo warm-up (Linux only) — prompt once upfront so mid-run prompts don't
+# hang when piped from curl
+# ─────────────────────────────────────────────────────────────────────────────
+if [ "$OS" != "Darwin" ]; then
+    echo ""
+    echo "  This script uses sudo for system packages and PostgreSQL."
+    echo "  Please enter your password now so it isn't prompted mid-run."
+    sudo -v
+    # Keep the sudo timestamp alive for the duration of the script
+    ( while true; do sudo -v; sleep 50; done ) &
+    SUDO_KEEPALIVE_PID=$!
+    trap 'kill $SUDO_KEEPALIVE_PID 2>/dev/null' EXIT
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
 # [1/6] System packages
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""
-echo "[1/6] Installing system packages ────────────────────────────────────────────"
+echo "[1/6] System packages ───────────────────────────────────────────────────────"
 
 if [ "$OS" = "Darwin" ]; then
     if ! command -v brew &>/dev/null; then
         echo "  Installing Homebrew..."
         NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-        # Add brew to PATH for the current session
         if [ "$ARCH" = "arm64" ]; then
             eval "$(/opt/homebrew/bin/brew shellenv)"
         else
             eval "$(/usr/local/bin/brew shellenv)"
         fi
+    else
+        echo "  Homebrew already installed — skipping."
     fi
-    brew install git curl wget
+
+    MISSING_PKGS=""
+    for cmd in git curl wget; do
+        command -v "$cmd" &>/dev/null || MISSING_PKGS="$MISSING_PKGS $cmd"
+    done
+    if [ -n "$MISSING_PKGS" ]; then
+        echo "  Installing:$MISSING_PKGS"
+        brew install $MISSING_PKGS
+    else
+        echo "  git, curl, wget already installed — skipping."
+    fi
 else
-    sudo apt-get update -qq
-    sudo apt-get install -y git curl wget build-essential
+    MISSING_PKGS=""
+    command -v git   &>/dev/null || MISSING_PKGS="$MISSING_PKGS git"
+    command -v curl  &>/dev/null || MISSING_PKGS="$MISSING_PKGS curl"
+    command -v wget  &>/dev/null || MISSING_PKGS="$MISSING_PKGS wget"
+    # build-essential has no single binary to check — always ensure it's present
+    if [ -n "$MISSING_PKGS" ] || ! dpkg -s build-essential &>/dev/null 2>&1; then
+        echo "  Running apt-get update and installing missing packages..."
+        sudo apt-get update -qq
+        sudo apt-get install -y git curl wget build-essential
+    else
+        echo "  git, curl, wget, build-essential already installed — skipping."
+    fi
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# [2/6] Anaconda
+# [2/6] Conda
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""
-echo "[2/6] Setting up Anaconda ───────────────────────────────────────────────────"
+echo "[2/6] Conda ─────────────────────────────────────────────────────────────────"
 
-if [ -d "$ANACONDA_DIR" ]; then
-    echo "  Anaconda already installed at $ANACONDA_DIR — skipping download."
+CONDA_DIR=""
+
+# 1. Already on PATH (covers system conda, previously activated envs, etc.)
+if command -v conda &>/dev/null; then
+    CONDA_DIR="$(conda info --base 2>/dev/null)"
+fi
+
+# 2. Common install locations not yet on PATH
+if [ -z "$CONDA_DIR" ]; then
+    for candidate in \
+        "$HOME/anaconda3" \
+        "$HOME/miniconda3" \
+        "$HOME/opt/anaconda3" \
+        "$HOME/opt/miniconda3" \
+        "/opt/anaconda3" \
+        "/opt/miniconda3"; do
+        if [ -f "$candidate/etc/profile.d/conda.sh" ]; then
+            CONDA_DIR="$candidate"
+            break
+        fi
+    done
+fi
+
+if [ -n "$CONDA_DIR" ]; then
+    echo "  conda found at $CONDA_DIR — skipping install."
 else
-    ANACONDA_INSTALLER="$HOME/anaconda_installer.sh"
+    echo "  conda not found — installing Anaconda..."
+    CONDA_DIR="$HOME/anaconda3"
 
     if [ "$OS" = "Darwin" ]; then
         if [ "$ARCH" = "arm64" ]; then
@@ -116,25 +175,31 @@ else
         ANACONDA_URL="https://repo.anaconda.com/archive/Anaconda3-2024.02-1-Linux-x86_64.sh"
     fi
 
+    ANACONDA_INSTALLER="$HOME/anaconda_installer.sh"
     echo "  Downloading Anaconda for $OS/$ARCH..."
     wget -q --show-progress -O "$ANACONDA_INSTALLER" "$ANACONDA_URL"
-    echo "  Installing Anaconda to $ANACONDA_DIR..."
-    bash "$ANACONDA_INSTALLER" -b -p "$ANACONDA_DIR"
+    bash "$ANACONDA_INSTALLER" -b -p "$CONDA_DIR"
     rm -f "$ANACONDA_INSTALLER"
-    echo "  Anaconda installed."
+    echo "  Anaconda installed at $CONDA_DIR"
 fi
 
-CONDA_INIT_LINE="source \$HOME/anaconda3/etc/profile.d/conda.sh"
-if ! grep -qF "$CONDA_INIT_LINE" "$SHELL_RC" 2>/dev/null; then
+# Source conda for the current session
+export PATH="$CONDA_DIR/bin:$PATH"
+# shellcheck disable=SC1090
+source "$CONDA_DIR/etc/profile.d/conda.sh"
+
+# Add conda init to shell profile if not already there
+CONDA_INIT_LINE="source \$HOME/$(basename "$CONDA_DIR")/etc/profile.d/conda.sh"
+# Use the actual path in case it's not in $HOME
+CONDA_INIT_LINE="source ${CONDA_DIR}/etc/profile.d/conda.sh"
+if ! grep -qF "$CONDA_DIR/etc/profile.d/conda.sh" "$SHELL_RC" 2>/dev/null; then
     echo "" >> "$SHELL_RC"
-    echo "# Anaconda" >> "$SHELL_RC"
+    echo "# conda" >> "$SHELL_RC"
     echo "$CONDA_INIT_LINE" >> "$SHELL_RC"
     echo "  Added conda init to $SHELL_RC"
+else
+    echo "  conda init already in $SHELL_RC — skipping."
 fi
-
-export PATH="$ANACONDA_DIR/bin:$PATH"
-# shellcheck disable=SC1090
-source "$ANACONDA_DIR/etc/profile.d/conda.sh"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # [3/6] Clone or update repo
@@ -206,7 +271,7 @@ echo ""
 echo "[5/6] Registering alias ─────────────────────────────────────────────────────"
 
 ALIAS_NAME="$KEYWORD"
-ALIAS_LINE="alias ${ALIAS_NAME}='source \$HOME/anaconda3/etc/profile.d/conda.sh && conda activate ${KEYWORD} && cd \$HOME/projects/${REPO_NAME}'"
+ALIAS_LINE="alias ${ALIAS_NAME}='source ${CONDA_DIR}/etc/profile.d/conda.sh && conda activate ${KEYWORD} && cd \$HOME/projects/${REPO_NAME}'"
 
 if grep -qF "alias ${ALIAS_NAME}=" "$SHELL_RC" 2>/dev/null; then
     echo "  Alias '$ALIAS_NAME' already exists in $SHELL_RC — skipping."
@@ -226,6 +291,7 @@ echo " Setup complete!"
 echo "─────────────────────────────────────────────────────────────────────────────"
 echo "  Repo cloned to : $REPO_DIR"
 echo "  Conda env      : $KEYWORD"
+echo "  Conda dir      : $CONDA_DIR"
 echo "  Alias          : $ALIAS_NAME"
 echo "  Shell profile  : $SHELL_RC"
 echo "─────────────────────────────────────────────────────────────────────────────"
