@@ -1,6 +1,6 @@
 # vm-bootstrap
 
-One-command development environment setup for Ubuntu Server VMs.
+One-command development environment setup for Ubuntu Server VMs and macOS.
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/m-np/vm-bootstrap/main/setup.sh | bash -s robinhood
@@ -25,10 +25,11 @@ The split exists because responsibilities differ:
 
 | Concern | Handled by | Why here |
 |---|---|---|
-| System packages (`git`, `curl`, `build-essential`) | root | Same on every VM, regardless of project |
+| System packages (`git`, `curl`, `build-essential`) | root | Same on every machine, regardless of project |
+| Homebrew install (macOS) | root | Shared prerequisite, not project-specific |
 | Anaconda install | root | Shared across all envs on the machine |
 | Cloning / pulling the repo | root | Needs the registry to know where to clone from |
-| SSH vs HTTPS decision | root | VM-level credential concern, not project-specific |
+| SSH vs HTTPS decision | root | Machine-level credential concern, not project-specific |
 | Shell alias registration | root | Knows the keyword and repo name |
 | Conda env creation | leaf | Project knows its own Python version and dependencies |
 | System libs the project needs (`libpq-dev`, etc.) | leaf | Project-specific |
@@ -41,22 +42,25 @@ The split exists because responsibilities differ:
 curl setup.sh | bash -s robinhood
         │
         ▼
-[root] apt-get install system packages
-[root] install Anaconda (idempotent)
+[root] detect OS (macOS or Linux) and CPU arch
+[root] install system packages
+          macOS  → Homebrew (if missing) → brew install git curl wget
+          Linux  → apt-get install git curl wget build-essential
+[root] install Anaconda (idempotent, picks correct installer for OS/arch)
 [root] git clone RobinhoodTrader → ~/projects/RobinhoodTrader
         │
         ├─ leaf found? (.vmsetup.sh exists)
         │       ▼
         │   [leaf] create conda env robinhoodtrader
         │   [leaf] pip install -r requirements.txt
-        │   [leaf] install + start PostgreSQL
+        │   [leaf] install + start PostgreSQL (brew services / systemctl)
         │   [leaf] generate Fernet key → inject into .env
         │   [leaf] warn user to fill in secrets
         │
         └─ no leaf? → root fallback (environment.yml or requirements.txt)
         │
         ▼
-[root] register alias in ~/.bashrc
+[root] register alias in shell profile (~/.zshrc on macOS, ~/.bashrc on Linux)
 [root] print summary + activation command
 ```
 
@@ -68,7 +72,18 @@ curl setup.sh | bash -s robinhood
 
 **Leaf scripts are also standalone.** A contributor who already has Anaconda and a cloned repo can run `.vmsetup.sh` directly without going through `setup.sh` at all. The contract between root and leaf is minimal: working directory is the repo root, `conda` is on `PATH`.
 
-**Safe for others to use.** The root script works for any public repo without credentials. Private repos require `--ssh` and an SSH key on the VM. The root detects the failure and explains what to do — it never silently half-installs.
+**Safe for others to use.** The root script works for any public repo without credentials. Private repos require `--ssh` and an SSH key on the machine. The root detects the failure and explains what to do — it never silently half-installs.
+
+---
+
+## Platform support
+
+| | macOS (Intel) | macOS (Apple Silicon) | Ubuntu / Debian Linux |
+|---|---|---|---|
+| Package manager | Homebrew | Homebrew | apt-get |
+| Anaconda installer | MacOSX-x86_64 | MacOSX-arm64 | Linux-x86_64 |
+| PostgreSQL (leaf) | `brew services` | `brew services` | `systemctl` |
+| Shell profile | `~/.zshrc` | `~/.zshrc` | `~/.bashrc` |
 
 ---
 
@@ -81,7 +96,7 @@ bash setup.sh <keyword> [--ssh]
 ### Examples
 
 ```bash
-# Public repo, or private repo with an SSH key on the VM
+# Public repo, or private repo with an SSH key on the machine
 bash setup.sh robinhood --ssh
 
 # Public repo via HTTPS (no SSH key needed)
@@ -101,16 +116,20 @@ bash setup.sh robinhood
 
 | Step | Action |
 |---|---|
-| 1 | `apt-get install git curl wget build-essential` |
-| 2 | Downloads and installs Anaconda to `~/anaconda3` (skips if already present) |
+| 1 | Install system packages (brew or apt-get depending on OS) |
+| 2 | Downloads and installs Anaconda to `~/anaconda3` (picks correct binary for OS/arch) |
 | 3 | Clones repo to `~/projects/<RepoName>` (or `git pull` if already cloned) |
 | 4 | Runs `.vmsetup.sh` in the repo if it exists, otherwise runs a default conda env setup |
-| 5 | Registers a shell alias in `~/.bashrc` |
+| 5 | Registers a shell alias in `~/.zshrc` (macOS) or `~/.bashrc` (Linux) |
 | 6 | Prints a summary with the activation command |
 
 After setup completes, activate the environment with:
 
 ```bash
+# macOS
+source ~/.zshrc && robinhood
+
+# Linux
 source ~/.bashrc && robinhood
 ```
 
@@ -122,10 +141,10 @@ This sources conda, activates the named env, and `cd`s into the project director
 
 By default the script clones via HTTPS, which works for public repos without any credentials.
 
-For **private repos**, you need an SSH key on the VM added to your GitHub account:
+For **private repos**, you need an SSH key on the machine added to your GitHub account:
 
 ```bash
-# 1. Generate a key on the VM (skip if you already have one)
+# 1. Generate a key (skip if you already have one)
 ssh-keygen -t ed25519 -C "your@email.com"
 
 # 2. Print the public key and add it to GitHub → Settings → SSH Keys
@@ -144,9 +163,18 @@ If you run without `--ssh` and the clone fails, the script prints a clear explan
 **Step 1** — add a line to `REPO_MAP` in `setup.sh`:
 
 ```bash
-declare -A REPO_MAP
-REPO_MAP["robinhood"]="https://github.com/m-np/RobinhoodTrader"
-REPO_MAP["myproject"]="https://github.com/m-np/MyProject"   # ← add here
+repo_url() {
+    case "$1" in
+        robinhood) echo "https://github.com/m-np/RobinhoodTrader" ;;
+        myproject) echo "https://github.com/m-np/MyProject" ;;   # ← add here
+        *)         echo "" ;;
+    esac
+}
+
+repo_keywords() {
+    echo "  robinhood  →  https://github.com/m-np/RobinhoodTrader"
+    echo "  myproject  →  https://github.com/m-np/MyProject"      # ← add here
+}
 ```
 
 The keyword becomes the conda env name and the shell alias.
